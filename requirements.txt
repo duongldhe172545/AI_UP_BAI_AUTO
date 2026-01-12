@@ -6,4 +6,3 @@ streamlit>=1.30,<2
 pydantic>=2.5,<3
 openai>=1.30,<2
 apscheduler>=3.10,<4
-imageio[ffmpeg]>=2.34,<3

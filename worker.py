@@ -1,9 +1,6 @@
 \
 import os
-import io
 import json
-import uuid
-import base64
 import datetime as dt
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -11,7 +8,6 @@ from typing import Any, Dict, List, Optional
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-import imageio.v3 as iio
 
 from db import init_db, get_post, list_posts, update_post, set_status
 
@@ -57,21 +53,19 @@ Yêu cầu bắt buộc:
 
 
 def load_config() -> AppConfig:
-    load_dotenv()
+    dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+    load_dotenv(dotenv_path=dotenv_path, override=True)
 
-    def req(key: str) -> str:
-        v = os.getenv(key)
-        if not v:
-            raise RuntimeError(f"Missing env var: {key}")
-        return v
+    def opt(key: str) -> str:
+        return (os.getenv(key) or "").strip()
 
     cfg = AppConfig(
-        openai_api_key=req("OPENAI_API_KEY"),
+        openai_api_key=opt("OPENAI_API_KEY"),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         openai_temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
         openai_base_url=os.getenv("OPENAI_BASE_URL") or None,
         serpapi_key=os.getenv("SERPAPI_KEY") or None,
-        fb_page_access_token=req("FB_PAGE_ACCESS_TOKEN"),
+        fb_page_access_token=(os.getenv("FB_PAGE_ACCESS_TOKEN") or "").strip(),
         default_page_id=os.getenv("DEFAULT_PAGE_ID", "").strip(),
         timezone=os.getenv("TIMEZONE", "Asia/Bangkok"),
         db_path=os.getenv("DB_PATH", "./data/app.db"),
@@ -121,6 +115,14 @@ def _extract_json_str(s: str) -> str:
 
 
 def generate_ai_json(cfg: AppConfig, topic: str, main: str, mandatory: str, seo_keywords: List[str]) -> Dict[str, str]:
+    if not cfg.openai_api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY (required for text generation)")
+    if str(cfg.openai_api_key).startswith("gsk_") and ("openai.com" in (cfg.openai_base_url or "")):
+        raise RuntimeError(
+            "You are using a Groq key ('gsk_...') with OpenAI base URL. "
+            "Fix: set OPENAI_BASE_URL to https://api.groq.com/openai/v1 (or your OpenAI-compatible provider), "
+            "or use an OpenAI API key (sk-...) with https://api.openai.com/v1."
+        )
     client = OpenAI(api_key=cfg.openai_api_key, base_url=cfg.openai_base_url)
 
     prompt_template = cfg.prompt_template or DEFAULT_PROMPT_TEMPLATE
@@ -184,6 +186,78 @@ def post_photo_by_url(page_id: str, page_access_token: str, image_url: str, mess
     return data
 
 
+def upload_photo_unpublished_by_url(
+    page_id: str,
+    page_access_token: str,
+    image_url: str,
+    graph_api_version: str = "v20.0",
+) -> Dict[str, Any]:
+    endpoint = f"https://graph.facebook.com/{graph_api_version}/{page_id}/photos"
+    payload = {
+        "url": image_url,
+        "published": "false",
+        "access_token": page_access_token,
+    }
+    resp = requests.post(endpoint, data=payload, timeout=120)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": resp.text}
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Facebook API error {resp.status_code}: {data}")
+    return data
+
+
+def upload_photo_unpublished_by_file(
+    page_id: str,
+    page_access_token: str,
+    file_path: str,
+    graph_api_version: str = "v20.0",
+) -> Dict[str, Any]:
+    endpoint = f"https://graph.facebook.com/{graph_api_version}/{page_id}/photos"
+    with open(file_path, "rb") as f:
+        files = {"source": f}
+        data = {
+            "published": "false",
+            "access_token": page_access_token,
+        }
+        resp = requests.post(endpoint, data=data, files=files, timeout=180)
+    try:
+        out = resp.json()
+    except Exception:
+        out = {"raw": resp.text}
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Facebook API error {resp.status_code}: {out}")
+    return out
+
+
+def create_feed_post_with_attached_media(
+    page_id: str,
+    page_access_token: str,
+    message: str,
+    media_fbids: List[str],
+    graph_api_version: str = "v20.0",
+) -> Dict[str, Any]:
+    if not media_fbids:
+        raise RuntimeError("No media ids for attached_media")
+    endpoint = f"https://graph.facebook.com/{graph_api_version}/{page_id}/feed"
+    payload: Dict[str, Any] = {
+        "message": message,
+        "access_token": page_access_token,
+    }
+    for idx, mid in enumerate(media_fbids):
+        payload[f"attached_media[{idx}]"] = json.dumps({"media_fbid": mid})
+
+    resp = requests.post(endpoint, data=payload, timeout=120)
+    try:
+        out = resp.json()
+    except Exception:
+        out = {"raw": resp.text}
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Facebook API error {resp.status_code}: {out}")
+    return out
+
+
 def post_photo_by_file(page_id: str, page_access_token: str, file_path: str, message: str, graph_api_version: str = "v20.0") -> Dict[str, Any]:
     endpoint = f"https://graph.facebook.com/{graph_api_version}/{page_id}/photos"
     with open(file_path, "rb") as f:
@@ -229,81 +303,37 @@ def post_video_by_file(page_id: str, page_access_token: str, file_path: str, mes
     return out
 
 
+def get_page_info_from_token(page_access_token: str, graph_api_version: str = "v20.0") -> Dict[str, str]:
+    """Best-effort resolve Page id/name from a Page access token.
+
+    For a Page access token, /me returns the Page object.
+    """
+    token = (page_access_token or "").strip()
+    if not token:
+        raise RuntimeError("Empty page access token")
+
+    endpoint = f"https://graph.facebook.com/{graph_api_version}/me"
+    params = {"fields": "id,name", "access_token": token}
+    resp = requests.get(endpoint, params=params, timeout=30)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": resp.text}
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Facebook API error {resp.status_code}: {data}")
+
+    pid = str(data.get("id", "")).strip()
+    name = str(data.get("name", "")).strip()
+    if not pid:
+        raise RuntimeError(f"Could not resolve Page id from token: {data}")
+    return {"id": pid, "name": name}
+
+
 def _uploads_dir(cfg: AppConfig) -> str:
     base = os.path.dirname(cfg.db_path) or "."
     path = os.path.join(base, "uploads")
     os.makedirs(path, exist_ok=True)
     return path
-
-
-def generate_ai_media(post_id: int, need_image: bool = True, need_video: bool = False) -> Dict[str, Any]:
-    cfg = load_config()
-    post = get_post(cfg.db_path, post_id)
-    if not post:
-        raise RuntimeError("Post not found")
-
-    topic = str(post.get("topic", "")).strip()
-    main = str(post.get("main", "")).strip()
-    if not (topic and main):
-        raise RuntimeError("Missing topic/main")
-
-    if need_video and not need_image:
-        need_image = True  # video generation builds from the AI image
-
-    updates: Dict[str, Any] = {}
-    result: Dict[str, Any] = {}
-
-    if need_image:
-        prompt = (
-            "Tạo 1 ảnh minh họa bắt mắt, phong cách chuyên nghiệp, màu sắc hài hòa cho chủ đề: "
-            f"{topic}. Ý chính: {main}. Phong cách hiện đại, rõ sản phẩm, không chữ lên ảnh."
-        )
-        client = OpenAI(api_key=cfg.openai_api_key, base_url=cfg.openai_base_url)
-        try:
-            img_resp = client.images.generate(
-                model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1"),
-                prompt=prompt,
-                size=os.getenv("OPENAI_IMAGE_SIZE", "1024x1024"),
-                response_format="b64_json",
-                n=1,
-            )
-            b64 = img_resp.data[0].b64_json
-            img_bytes = base64.b64decode(b64)
-            img_arr = iio.imread(io.BytesIO(img_bytes), extension=".png")
-        except Exception as e:
-            raise RuntimeError(f"AI image generation failed: {e}")
-
-        uploads = _uploads_dir(cfg)
-        image_file_name = f"ai_{uuid.uuid4().hex}.png"
-        image_path = os.path.join(uploads, image_file_name)
-        iio.imwrite(image_path, img_arr)
-        updates["ai_image_file_name"] = image_file_name
-        result["ai_image_file_name"] = image_file_name
-
-        # Auto-fill image for posting if none provided
-        if not post.get("image_file_name") and not post.get("image_url"):
-            updates["image_file_name"] = image_file_name
-
-        if need_video:
-            fps = 24
-            duration = 4
-            frames = [img_arr for _ in range(fps * duration)]
-            video_file_name = f"ai_{uuid.uuid4().hex}.mp4"
-            video_path = os.path.join(uploads, video_file_name)
-            try:
-                iio.imwrite(video_path, frames, fps=fps)
-            except Exception as e:
-                raise RuntimeError(f"AI video rendering failed: {e}")
-            updates["ai_video_file_name"] = video_file_name
-            result["ai_video_file_name"] = video_file_name
-
-            if not post.get("video_file_name") and not post.get("video_url"):
-                updates["video_file_name"] = video_file_name
-
-    if updates:
-        update_post(cfg.db_path, post_id, {**updates, "last_error": ""})
-
-    return {"post_id": post_id, **result}
 
 
 def generate_preview(post_id: int) -> Dict[str, Any]:
@@ -314,9 +344,14 @@ def generate_preview(post_id: int) -> Dict[str, Any]:
 
     topic = str(post.get("topic", "")).strip()
     main = str(post.get("main", "")).strip()
+    extra_requirements = str(post.get("extra_requirements", "")).strip()
     mandatory = str(post.get("mandatory", "")).strip()
     if not (topic and main):
         raise RuntimeError("Missing topic/main")
+
+    combined_main = main
+    if extra_requirements:
+        combined_main = f"{main}\n\nYêu cầu bổ sung (từ trang duyệt):\n{extra_requirements}".strip()
 
     seo: List[str] = []
     if cfg.serpapi_key:
@@ -325,7 +360,7 @@ def generate_preview(post_id: int) -> Dict[str, Any]:
         except Exception as e:
             seo = [f"(SerpAPI lỗi: {e})"]
 
-    ai = generate_ai_json(cfg, topic, main, mandatory, seo)
+    ai = generate_ai_json(cfg, topic, combined_main, mandatory, seo)
     caption = build_caption(ai["title"], ai["content"], mandatory)
 
     update_post(cfg.db_path, post_id, {
@@ -339,7 +374,7 @@ def generate_preview(post_id: int) -> Dict[str, Any]:
     return {"post_id": post_id, "seo_keywords": seo, "ai": ai, "caption": caption}
 
 
-def post_to_facebook(post_id: int) -> Dict[str, Any]:
+def post_to_facebook(post_id: int, page_access_token_override: Optional[str] = None) -> Dict[str, Any]:
     cfg = load_config()
     post = get_post(cfg.db_path, post_id)
     if not post:
@@ -349,7 +384,16 @@ def post_to_facebook(post_id: int) -> Dict[str, Any]:
     if status not in ("APPROVED",):
         raise RuntimeError("Post must be APPROVED before posting")
 
+    page_access_token = (page_access_token_override or "").strip() or cfg.fb_page_access_token
+    if not page_access_token:
+        raise RuntimeError(
+            "Missing FB page access token (provide it from UI per post, or set FB_PAGE_ACCESS_TOKEN in .env)"
+        )
+
     page_id = (str(post.get("page_id", "")).strip() or cfg.default_page_id)
+    if not page_id:
+        # If user provides a Page token, we can resolve the Page id automatically.
+        page_id = get_page_info_from_token(page_access_token).get("id", "").strip()
     if not page_id:
         raise RuntimeError("Missing page_id (set in post or DEFAULT_PAGE_ID)")
 
@@ -361,29 +405,114 @@ def post_to_facebook(post_id: int) -> Dict[str, Any]:
 
     image_url = str(post.get("image_url", "")).strip()
     image_file_name = str(post.get("image_file_name", "")).strip()
+    image_urls: List[str] = []
+    image_file_names: List[str] = []
+
+    try:
+        image_urls = [str(x).strip() for x in (json.loads(post.get("image_urls_json") or "[]") or []) if str(x).strip()]
+    except Exception:
+        image_urls = []
+    try:
+        image_file_names = [
+            str(x).strip()
+            for x in (json.loads(post.get("image_file_names_json") or "[]") or [])
+            if str(x).strip()
+        ]
+    except Exception:
+        image_file_names = []
+
+    # Backward compatibility
+    if not image_urls and image_url:
+        image_urls = [image_url]
+    if not image_file_names and image_file_name:
+        image_file_names = [image_file_name]
     video_url = str(post.get("video_url", "")).strip()
     video_file_name = str(post.get("video_file_name", "")).strip()
+
+    video_urls: List[str] = []
+    video_file_names: List[str] = []
+    try:
+        video_urls = [str(x).strip() for x in (json.loads(post.get("video_urls_json") or "[]") or []) if str(x).strip()]
+    except Exception:
+        video_urls = []
+    try:
+        video_file_names = [
+            str(x).strip()
+            for x in (json.loads(post.get("video_file_names_json") or "[]") or [])
+            if str(x).strip()
+        ]
+    except Exception:
+        video_file_names = []
+
+    # Backward compatibility
+    if not video_urls and video_url:
+        video_urls = [video_url]
+    if not video_file_names and video_file_name:
+        video_file_names = [video_file_name]
 
     try:
         upload_dir = _uploads_dir(cfg)
         fb_resp: Dict[str, Any]
 
-        if video_file_name or video_url:
-            if video_file_name:
-                file_path = os.path.join(upload_dir, video_file_name)
-                fb_resp = post_video_by_file(page_id, cfg.fb_page_access_token, file_path, caption)
-            else:
-                fb_resp = post_video_by_url(page_id, cfg.fb_page_access_token, video_url, caption)
-        elif image_file_name:
-            file_path = os.path.join(upload_dir, image_file_name)
-            fb_resp = post_photo_by_file(page_id, cfg.fb_page_access_token, file_path, caption)
-        else:
-            if not image_url:
-                raise RuntimeError("Missing media (image/video)")
-            fb_resp = post_photo_by_url(page_id, page_access_token=cfg.fb_page_access_token, image_url=image_url, message=caption)
+        fb_resps: List[Dict[str, Any]] = []
+        post_ids: List[str] = []
+        post_urls: List[str] = []
 
-        post_id_fb = fb_resp.get("post_id") or fb_resp.get("id") or ""
+        if video_file_names or video_urls:
+            # Facebook only supports 1 video per post. If user provides multiple videos,
+            # we post them sequentially as multiple posts.
+            if video_file_names:
+                for fn in video_file_names:
+                    file_path = os.path.join(upload_dir, fn)
+                    r = post_video_by_file(page_id, page_access_token, file_path, caption)
+                    fb_resps.append(r)
+            else:
+                for u in video_urls:
+                    r = post_video_by_url(page_id, page_access_token, u, caption)
+                    fb_resps.append(r)
+
+            for r in fb_resps:
+                pid_fb = str(r.get("post_id") or r.get("id") or "").strip()
+                post_ids.append(pid_fb)
+                post_urls.append(f"https://www.facebook.com/{pid_fb}" if pid_fb else "")
+
+            fb_resp = fb_resps[-1] if fb_resps else {}
+        else:
+            # Images only (single or multiple)
+            if image_file_names:
+                if len(image_file_names) == 1:
+                    file_path = os.path.join(upload_dir, image_file_names[0])
+                    fb_resp = post_photo_by_file(page_id, page_access_token, file_path, caption)
+                else:
+                    media_ids: List[str] = []
+                    for fn in image_file_names:
+                        file_path = os.path.join(upload_dir, fn)
+                        up = upload_photo_unpublished_by_file(page_id, page_access_token, file_path)
+                        mid = str(up.get("id") or "").strip()
+                        if not mid:
+                            raise RuntimeError(f"Upload photo returned no id: {up}")
+                        media_ids.append(mid)
+                    fb_resp = create_feed_post_with_attached_media(page_id, page_access_token, caption, media_ids)
+            elif image_urls:
+                if len(image_urls) == 1:
+                    fb_resp = post_photo_by_url(page_id, page_access_token=page_access_token, image_url=image_urls[0], message=caption)
+                else:
+                    media_ids = []
+                    for u in image_urls:
+                        up = upload_photo_unpublished_by_url(page_id, page_access_token, u)
+                        mid = str(up.get("id") or "").strip()
+                        if not mid:
+                            raise RuntimeError(f"Upload photo returned no id: {up}")
+                        media_ids.append(mid)
+                    fb_resp = create_feed_post_with_attached_media(page_id, page_access_token, caption, media_ids)
+            else:
+                raise RuntimeError("Missing media (image/video)")
+
+        post_id_fb = str(fb_resp.get("post_id") or fb_resp.get("id") or "")
         post_url = f"https://www.facebook.com/{post_id_fb}" if post_id_fb else ""
+        if post_ids:
+            post_id_fb = post_ids[0]
+            post_url = post_urls[0]
 
         posted_at = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
         update_post(cfg.db_path, post_id, {
@@ -391,14 +520,67 @@ def post_to_facebook(post_id: int) -> Dict[str, Any]:
             "page_id": page_id,
             "fb_post_id": str(post_id_fb),
             "fb_post_url": post_url,
+            "fb_post_ids_json": json.dumps([p for p in post_ids if p], ensure_ascii=False) if post_ids else json.dumps([str(post_id_fb)], ensure_ascii=False),
+            "fb_post_urls_json": json.dumps([u for u in post_urls if u], ensure_ascii=False) if post_urls else json.dumps([post_url], ensure_ascii=False),
             "posted_at": posted_at,
             "last_error": "",
         })
 
-        return {"status": "posted", "post_id": post_id, "fb": fb_resp, "post_url": post_url}
+        out: Dict[str, Any] = {"status": "posted", "post_id": post_id, "fb": fb_resp, "post_url": post_url}
+        if post_urls:
+            out["post_urls"] = post_urls
+            out["fb_list"] = fb_resps
+        return out
     except Exception as e:
         set_status(cfg.db_path, post_id, "FAILED", str(e))
         raise
+
+
+def post_to_facebook_multi(post_id: int, page_access_tokens: List[str]) -> Dict[str, Any]:
+    """Post the same content to multiple fanpages, one per Page access token.
+
+    Tokens are NOT stored in DB. DB status is set to POSTED only if all succeed.
+    """
+    cfg = load_config()
+    post = get_post(cfg.db_path, post_id)
+    if not post:
+        raise RuntimeError("Post not found")
+
+    status = str(post.get("status", "")).strip()
+    if status not in ("APPROVED",):
+        raise RuntimeError("Post must be APPROVED before posting")
+
+    tokens = [str(t or "").strip() for t in (page_access_tokens or []) if str(t or "").strip()]
+    if not tokens:
+        raise RuntimeError("No FB_PAGE_ACCESS_TOKEN provided")
+
+    results: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+
+    for token in tokens:
+        try:
+            info = get_page_info_from_token(token)
+            out = post_to_facebook(post_id, page_access_token_override=token)
+            results.append({
+                "page_id": info.get("id"),
+                "page_name": info.get("name"),
+                "post_url": out.get("post_url", ""),
+                "fb": out.get("fb", {}),
+                "ok": True,
+            })
+        except Exception as e:
+            # Keep going so user can see partial results.
+            failures.append({"ok": False, "error": str(e)})
+            results.append({"ok": False, "error": str(e)})
+
+    if failures:
+        set_status(cfg.db_path, post_id, "FAILED", f"Multi-post failures: {len(failures)}/{len(tokens)}")
+    else:
+        # Store a quick summary of URLs for convenience.
+        urls = [r.get("post_url", "") for r in results if r.get("ok") and r.get("post_url")]
+        update_post(cfg.db_path, post_id, {"status": "POSTED", "fb_post_url": "\n".join(urls), "last_error": ""})
+
+    return {"status": "multi_posted", "post_id": post_id, "results": results, "failed": len(failures)}
 
 
 def post_next_approved() -> Dict[str, Any]:
